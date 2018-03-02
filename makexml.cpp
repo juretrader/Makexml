@@ -9,8 +9,6 @@
 #include <map>
 #include <iomanip>
 
-#define version_2
-
 using namespace std;
 
 //////////////////////////////////////////////////////////
@@ -55,9 +53,6 @@ enum Doh_KDVP_line_values
 	Doh_KDVP_line_values_shares,
 	Doh_KDVP_line_values_price,
 	Doh_KDVP_line_values_loss_valid,
-#ifndef version_2
-	Doh_KDVP_line_values_remain_shares,
-#endif
 
 	Doh_KDVP_line_values_last
 };
@@ -297,9 +292,6 @@ static elementInfoMap_t init_Doh_KDVP_map()
 	info.name = "F8";
 	info.elementId = Doh_KDVP_element_F8;
 	info.type = tagTypeParam;
-#ifndef version_2
-	info.lineElementId = Doh_KDVP_line_values_remain_shares;
-#endif
 	map[Doh_KDVP_element_F8] = info;
 
 	// Doh_KDVP_element_F9
@@ -348,7 +340,7 @@ static const int rootElement = Doh_KDVP_element_KDVPItem;
 static const string baseFileName = "base.xml";
 static const string inputFileName = "input.csv";
 static const string outputFileName = "output.xml";
-static const string currConvFileName = "conversion.txt";
+static const string currConvFileName = "conversion.xml";
 
 
 /////////////////////////////////////////////////////
@@ -407,9 +399,266 @@ static bool useCurrConversion = false;
 // Remaining shares of the current item
 static int remainingShares = 0;
 
+// Local conversion storage
+static map<string,string> conversionMap;	// <date,rate>
+
 /////////////////////////////////////////////////////
 // Static functions that perform different operations
 /////////////////////////////////////////////////////
+
+// Convert conversion file to local storage
+static bool conversionFileToLocalStorage(const string fileName)
+{
+	string line, dateStr, currStr;
+	ifstream inputFile;
+	const string tagTecajnica = "tecajnica datum";	// Defines new date
+	const string tagTecaj = "USD";					// Defines USD rate
+	vector<pair<string,string> > vec;				// Vector of pairs <date,rate>
+
+	// Open file
+	inputFile.open(fileName.c_str(), ifstream::in);
+	
+	if (!inputFile.is_open())
+	{
+		cout << __FUNCTION__ << ":" << __LINE__ << ": "
+				<< "Cannot open input conversion file!" << endl;
+		return false;
+	}
+	
+	// The main loop -
+	// Read input file line by line and store date and value in local storage
+	while(getline(inputFile, line))
+	{
+		if (line.find(tagTecajnica) != std::string::npos)
+		{
+			// New date - just store it
+			dateStr = line.substr(line.find("\"")+1, 10);
+		}
+		else if (line.find(tagTecaj) != std::string::npos)
+		{
+			// New rate
+			currStr = line.substr(line.find(">")+1, 6);
+			
+			// Push current date/rate combination into vector
+			vec.push_back(make_pair(dateStr,currStr));
+
+		}
+	}
+
+	// Close file
+	inputFile.close();
+	string lastValidDate, lastValidRate;
+	unsigned thisYear, thisMonth, thisDay;
+	unsigned lastYear, lastMonth, lastDay;
+	stringstream ss, ss1;
+
+	// We'll add missing days (weekends, holidays, etc.) to avoid date misses
+	// Mind that we assume that values are pushed back in ascending order of dates from XML!
+	for (vector<pair<string,string> >::iterator it = vec.begin(); it != vec.end(); it++)
+	{
+		if (lastValidDate.size() > 0 && lastValidRate.size() > 0)
+		{
+			// If there are gaps in between last valid and current date,
+			// we have to fill them with last valid date
+			
+			// This...
+			ss.str("");
+			ss.clear();
+			ss << it->first.substr(0, 4);
+			ss >> thisYear;
+			ss.str("");
+			ss.clear();
+			ss << it->first.substr(5, 2);
+			ss >> thisMonth;
+			ss.str("");
+			ss.clear();
+			ss << it->first.substr(8, 2);
+			ss >> thisDay;
+			
+			// Last valid...
+			ss.str("");
+			ss.clear();
+			ss << lastValidDate.substr(0, 4);
+			ss >> lastYear;
+			ss.str("");
+			ss.clear();
+			ss << lastValidDate.substr(5, 2);
+			ss >> lastMonth;
+			ss.str("");
+			ss.clear();
+			ss << lastValidDate.substr(8, 2);
+			ss >> lastDay;
+			
+			if (thisYear == lastYear)
+			{
+				// Same year
+				if (thisMonth == lastMonth)
+				{
+					// Same month
+					if (thisDay > lastDay + 1)
+					{
+						// Gaps!
+						for (int i = lastDay + 1; i < thisDay; i++)
+						{
+							ss1.str("");
+							ss1.clear();
+							// Compose date and push it to map with last valid rate
+							ss1 << thisYear << "-" << setw(2) << setfill('0') << thisMonth << "-" << setw(2) << setfill('0') << i;
+							
+							// Do some error checking
+							if (conversionMap.find(ss1.str()) != conversionMap.end())
+							{
+								cout << __FUNCTION__ << ":" << __LINE__ << ": "
+									<< "Date already exists in conversion map: " << ss1.str() << endl;
+					 
+								return false;
+							}
+							else
+								conversionMap[ss1.str()] = lastValidRate;
+						}
+					}
+				}
+				else if (thisMonth == lastMonth + 1)
+				{
+					// New month in same year
+					if (lastDay < 31)
+					{
+						// Gaps at the end of last month
+						for (int i = lastDay + 1; i <= 31; i++)
+						{
+							ss1.str("");
+							ss1.clear();
+							// Compose date and push it to map with last valid rate
+							ss1 << thisYear << "-" << setw(2) << setfill('0') << lastMonth << "-" << setw(2) << setfill('0') << i;
+							
+							if (conversionMap.find(ss1.str()) != conversionMap.end())
+							{
+								cout << __FUNCTION__ << ":" << __LINE__ << ": "
+									<< "Date already exists in conversion map: " << ss1.str() << endl;
+					 
+								return false;
+							}
+							else
+								conversionMap[ss1.str()] = lastValidRate;
+						}
+					}
+					
+					if (thisDay > 1)
+					{
+						// Gaps at the beginning of new month
+						for (int i = 1; i < thisDay; i++)
+						{
+							ss1.str("");
+							ss1.clear();
+							// Compose date and push it to map with last valid rate
+							ss1 << thisYear << "-" << setw(2) << setfill('0') << thisMonth << "-" << setw(2) << setfill('0') << i;
+							
+							if (conversionMap.find(ss1.str()) != conversionMap.end())
+							{
+								cout << __FUNCTION__ << ":" << __LINE__ << ": "
+									<< "Date already exists in conversion map: " << ss1.str() << endl;
+					 
+								return false;
+							}
+							else
+								conversionMap[ss1.str()] = lastValidRate;
+						}
+					}
+				}
+				else
+				{
+					cout << __FUNCTION__ << ":" << __LINE__ << ": "
+						<< "Skipping month??: " << lastValidDate << ">" << it->first << endl;
+					 
+					return false;
+				}
+			}
+			else if (thisYear == lastYear + 1)
+			{
+				// New year
+				if (thisMonth != 1 || lastMonth != 12)
+				{
+					cout << __FUNCTION__ << ":" << __LINE__ << ": "
+						<< "Skipping month of new year??: " << lastValidDate << ">" << it->first << endl;
+					 
+					return false;
+				}
+				
+				// New month in new year
+				if (lastDay < 31)
+				{
+					// Gaps at the end of last month
+					for (int i = lastDay + 1; i <= 31; i++)
+					{
+						ss1.str("");
+						ss1.clear();
+						// Compose date and push it to map with last valid rate
+						ss1 << lastYear << "-" << setw(2) << setfill('0') << lastMonth << "-" << setw(2) << setfill('0') << i;
+						
+						if (conversionMap.find(ss1.str()) != conversionMap.end())
+						{
+							cout << __FUNCTION__ << ":" << __LINE__ << ": "
+								<< "Date already exists in conversion map: " << ss1.str() << endl;
+				 
+							return false;
+						}
+						else
+							conversionMap[ss1.str()] = lastValidRate;
+					}
+				}
+					
+				if (thisDay > 1)
+				{
+					// Gaps at the beginning of new month of new year
+					for (int i = 1; i < thisDay; i++)
+					{
+						ss1.str("");
+						ss1.clear();
+						// Compose date and push it to map with last valid rate
+						ss1 << thisYear << "-" << setw(2) << setfill('0') << thisMonth << "-" << setw(2) << setfill('0') << i;
+						
+						if (conversionMap.find(ss1.str()) != conversionMap.end())
+						{
+							cout << __FUNCTION__ << ":" << __LINE__ << ": "
+								<< "Date already exists in conversion map: " << ss1.str() << endl;
+				 
+							return false;
+						}
+						else
+							conversionMap[ss1.str()] = lastValidRate;
+					}
+				}
+			}
+			else
+			{
+				cout << __FUNCTION__ << ":" << __LINE__ << ": "
+					 << "Skipping year??: " << lastValidDate << ">" << it->first << endl;
+					 
+				return false;
+			}
+		}
+		
+		// Now add current date to map and store last valid date
+		if (conversionMap.find(it->first) != conversionMap.end())
+		{
+			cout << __FUNCTION__ << ":" << __LINE__ << ": "
+				<< "Date already exists in conversion map: " << it->first << endl;
+				
+			for (map<string,string>::iterator it = conversionMap.begin(); it != conversionMap.end(); it++)
+			cout << it->first << "," << it->second << endl;
+		
+			return false;
+		}
+		else
+			conversionMap[it->first] = it->second;
+		
+		
+		lastValidDate = it->first;
+		lastValidRate = it->second;
+	}
+
+	return true;
+}
 
 // Return if we are processing an existing item
 static bool ifExistingItem(const elementInfo_t& element)
@@ -527,31 +776,15 @@ static bool doShowElement(const elementInfo_t& element)
 // Get converted price parameter value
 static int getConvertionRate(const string& date, string& convertionRate)
 {
-	// Open file
-	currConvFile.open(currConvFileName.c_str(), ifstream::in);
-
-	if (!currConvFile.is_open())
+	map<string,string>::iterator it;
+	if ((it = conversionMap.find(date)) == conversionMap.end())
 	{
 		cout << __FUNCTION__ << ":" << __LINE__ << ": "
-				<< "Cannot open currConvFile!" << endl;
+				<< "No conversion rate for date: " << date << endl;
 		return 1;
 	}
-
-	string line, dateTmp;
-	while(getline(currConvFile, line))
-	{
-		// Get date from file
-		dateTmp = line.substr(0, 10);
-		if (dateTmp == date)
-		{
-			// Get rate from file
-			convertionRate = line.substr(11);
-			break;
-		}
-	}
-
-	// Close file
-	currConvFile.close();
+	else
+		convertionRate = it->second;
 
 	return 0;
 }
@@ -925,6 +1158,14 @@ int main(int argc, char* argv[])
 
 	if (argc >= 2 && !strcmp(argv[1], "convert"))
 	{
+		// Transform currency conversion file to local storage
+		if (!conversionFileToLocalStorage(currConvFileName))
+		{
+			cout << __FUNCTION__ << ":" << __LINE__ << ": "
+				<< "Error converting currency file to local storage!" << endl;
+				
+			return 1;
+		}
 		cout << "Using currency conversion" << endl;
 		useCurrConversion = true;
 	}

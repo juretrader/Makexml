@@ -8,6 +8,7 @@
 #include <vector>
 #include <map>
 #include <iomanip>
+#include <ctime>
 
 using namespace std;
 
@@ -52,7 +53,6 @@ enum Doh_KDVP_line_values
 	Doh_KDVP_line_values_date,
 	Doh_KDVP_line_values_shares,
 	Doh_KDVP_line_values_price,
-	Doh_KDVP_line_values_loss_valid,
 
 	Doh_KDVP_line_values_last
 };
@@ -307,7 +307,6 @@ static elementInfoMap_t init_Doh_KDVP_map()
 	info.name = "F10";
 	info.elementId = Doh_KDVP_element_F10;
 	info.type = tagTypeParam;
-	info.lineElementId = Doh_KDVP_line_values_loss_valid;
 	map[Doh_KDVP_element_F10] = info;
 
 	return map;
@@ -324,24 +323,41 @@ static const unsigned item_identifier = Doh_KDVP_line_values_trans_id;
 static const elementInfoMap_t elementInfoMap = init_Doh_KDVP_map();
 
 // Expected number of line values
-static const unsigned lineValuesNum = Doh_KDVP_line_values_last;
-
-// Vector that stores line values
-// Mind that order of these values in vector is important
-static vector<string> lineValues(lineValuesNum);
+static const unsigned currLineValuesNum = Doh_KDVP_line_values_last;
 
 // Root element - algorithm starts building element tree from here
 static const int rootElement = Doh_KDVP_element_KDVPItem;
 
-////////////////////////////////////////////////////////
-// Base input, output and currency convertion file names
-////////////////////////////////////////////////////////
+// Name transaction types
+enum transactionType
+{
+	transactionTypeBuy = 0,
+	transactionTypeSell,
+	transactionTypeSellShort,
+	transactionTypeBuyCover,
+};
 
-static const string baseFileName = "base.xml";
-static const string inputFileName = "input.csv";
-static const string outputFileName = "output.xml";
-static const string currConvFileName = "conversion.xml";
+static map<transactionType,string> init_transaction_names()
+{
+	map<transactionType,string> tmpMap;
+	tmpMap[transactionTypeBuy] = "Buy";
+	tmpMap[transactionTypeSell] = "Sell";
+	tmpMap[transactionTypeSellShort] = "SellShort";
+	tmpMap[transactionTypeBuyCover] = "BuyCover";
+	return tmpMap;
+};
 
+static map<transactionType,string> transactionTypeNames = init_transaction_names();
+
+////////////////////////////////////////////////////////////////
+// Base input, output and currency convertion default file names
+////////////////////////////////////////////////////////////////
+
+static string baseFileName = "base.xml";
+static string inputFileName = "input.csv";
+static string outputFileName = "output.xml";
+static string currConvFileName = "conversion.xml";
+static string tagTecaj = "USD";
 
 /////////////////////////////////////////////////////
 //	Data for string parsing and building XML
@@ -357,13 +373,6 @@ static string depth = startDepth;
 // String in file that defines location where we should insert our content
 // </KDVP> tag concludes header after which items should follow
 static const string insertContentAfter = "</KDVP>";
-
-// Base, input, output and currencty convertion files can be global
-// because all functions work with them
-static ifstream baseFile;
-static ifstream inputFile;
-static ofstream outputFile;
-static ifstream currConvFile;
 
 // If we want to include currency converting or not
 static bool useCurrConversion = false;
@@ -399,8 +408,38 @@ static bool useCurrConversion = false;
 // Remaining shares of the current item
 static int remainingShares = 0;
 
+// Vector that stores current line values
+// Mind that order of these values in vector is important
+typedef vector<string> lineValues_t;
+static lineValues_t currLineValues(currLineValuesNum);
+
+// A map of transactions used as the basic input for XML
+// Trades are sorted in the following way:
+//   - ticker
+//     - long trades
+//       - transaction_id -> values
+//     - short trades
+//       - transaction_id -> values
+
+enum tradeDirection
+{
+	tradeLong = 0,
+	tradeShort = 1
+};
+
+typedef map<string,lineValues_t> transactionIdMap_t;					// <transaction_id,line_values>
+typedef map<tradeDirection,transactionIdMap_t> tradeDirectionMap_t;		// <tradeDirection, ...>
+typedef map<string,tradeDirectionMap_t> transactionMap_t;				// <ticker, ... >
+static transactionMap_t transactionMap;
+
 // Local conversion storage
 static map<string,string> conversionMap;	// <date,rate>
+
+// A variable denoting if the last element is being processed
+static bool lastElement = false;
+
+// Already washed shares for this ticker - needed for wash sale calculation
+static unsigned alreadyWashed = 0;
 
 /////////////////////////////////////////////////////
 // Static functions that perform different operations
@@ -412,7 +451,6 @@ static bool conversionFileToLocalStorage(const string fileName)
 	string line, dateStr, currStr;
 	ifstream inputFile;
 	const string tagTecajnica = "tecajnica datum";	// Defines new date
-	const string tagTecaj = "USD";					// Defines USD rate
 	vector<pair<string,string> > vec;				// Vector of pairs <date,rate>
 
 	// Open file
@@ -425,19 +463,18 @@ static bool conversionFileToLocalStorage(const string fileName)
 		return false;
 	}
 	
-	// The main loop -
 	// Read input file line by line and store date and value in local storage
 	while(getline(inputFile, line))
 	{
 		if (line.find(tagTecajnica) != std::string::npos)
 		{
 			// New date - just store it
-			dateStr = line.substr(line.find("\"")+1, 10);
+			dateStr = line.substr(line.find_first_of("\"")+1, line.find_last_of("\"")-line.find_first_of("\"")-1);
 		}
 		else if (line.find(tagTecaj) != std::string::npos)
 		{
 			// New rate
-			currStr = line.substr(line.find(">")+1, 6);
+			currStr = line.substr(line.find_first_of(">")+1, line.find_last_of("<")-line.find_first_of(">")-1);
 			
 			// Push current date/rate combination into vector
 			vec.push_back(make_pair(dateStr,currStr));
@@ -663,14 +700,14 @@ static bool conversionFileToLocalStorage(const string fileName)
 // Return if we are processing an existing item
 static bool ifExistingItem(const elementInfo_t& element)
 {
-	if (lineValues[Doh_KDVP_line_values_trans_id] != "0")
+	if (currLineValues[Doh_KDVP_line_values_trans_id] != "0")
 		return true;
 	else
 		return false;
 }
 
 // Set beginning and ending string from base file
-static void setBaseStr(string& beginStr, string& endStr)
+static void setBaseStr(string& beginStr, string& endStr, ifstream& baseFile)
 {
 	string line;
 	string baseFileString;
@@ -689,8 +726,8 @@ static void setBaseStr(string& beginStr, string& endStr)
 	endStr = baseFileString.substr(pos);
 }
 
-// Set line values in a structure which we will use to actually build elements
-static int setLineValues(string& str)
+// Set line values in a vector
+static int setLineValues(string& str, lineValues_t& lineVec)
 {
 	int prevDelim = -1, currPos = -1;
 	string element;
@@ -705,15 +742,110 @@ static int setLineValues(string& str)
 			str.erase(it);
 	}
 
-	// Clear lineValues vector
-	lineValues.clear();
-
 	// Get elements from line string
 	stringstream ss(str);
 	while(getline(ss, element, delimiter))
-		lineValues.push_back(element);
+		lineVec.push_back(element);
 
 	return 0;
+}
+
+// Convert input file to local storage
+static bool inputFileToLocalStorage(const string fileName)
+{
+	ifstream inputFile;
+	string line;
+	lineValues_t currLineVec;
+
+	// Open input file
+	inputFile.open(fileName.c_str(), ifstream::in);
+
+	if (!inputFile.is_open())
+	{
+		cout << __FUNCTION__ << ":" << __LINE__ << ": "
+				<< "Cannot open input file!" << endl;
+		return 1;
+	}
+
+	// Set stream pointer to beginning
+	inputFile.clear();
+	inputFile.seekg(0);
+
+	// Read input file line by line and store values
+	unsigned lineNum = 0;
+
+	while(getline(inputFile, line))
+	{
+		lineNum++;
+		currLineVec.clear();
+		if (setLineValues(line, currLineVec) != 0)
+		{
+			cout << __FUNCTION__ << ":" << __LINE__ << ": "
+					<< "Error setting line values at line " << lineNum << endl;
+			return 1;
+		}
+
+		// Get trade direction
+		tradeDirection direction;
+		if (currLineVec[Doh_KDVP_line_values_trans_type] == transactionTypeNames[transactionTypeBuy] ||
+			currLineVec[Doh_KDVP_line_values_trans_type] == transactionTypeNames[transactionTypeSell])
+		{
+			// Long
+			direction = tradeLong;
+		}
+		else if (currLineVec[Doh_KDVP_line_values_trans_type] == transactionTypeNames[transactionTypeSellShort] ||
+				 currLineVec[Doh_KDVP_line_values_trans_type] == transactionTypeNames[transactionTypeBuyCover])
+		{
+			// Short
+			direction = tradeShort;
+		}
+		else
+		{
+			cout << __FUNCTION__ << ":" << __LINE__ << ": "
+					<< "Unknown transaction type '" <<  currLineVec[Doh_KDVP_line_values_trans_type]
+					<< "' at line: " << lineNum << endl;
+
+			return 1;
+		}
+
+		// Add line into map at the correct place (long or short trade for this ticker)
+		transactionMap_t::iterator it1 = transactionMap.find(currLineVec[Doh_KDVP_line_values_ticker]);
+		if (it1 != transactionMap.end())
+		{
+			// Ticker already exists in map
+			// Check if this transaction id already exists for this direction
+			transactionIdMap_t::iterator it2 = it1->second[direction].find(currLineVec[Doh_KDVP_line_values_trans_id]);
+			if (it2 != it1->second[direction].end())
+			{
+				cout << __FUNCTION__ << ":" << __LINE__ << ": "
+						<< "Transaction id '" << currLineVec[Doh_KDVP_line_values_trans_id]
+						<< "' already exists for ticker: " << currLineVec[Doh_KDVP_line_values_ticker]
+						<< ", direction: " << (direction == tradeLong ? "Long" : "Short")
+						<< ", line: " << lineNum << endl;
+
+				return false;
+			}
+			else
+				it1->second[direction][currLineVec[Doh_KDVP_line_values_trans_id]] = currLineVec;
+		}
+		else
+		{
+			// New ticker in map - create both long and short empty maps
+			tradeDirectionMap_t tmpTradeDirectionMap;
+			tmpTradeDirectionMap[tradeLong];
+			tmpTradeDirectionMap[tradeShort];
+			transactionMap[currLineVec[Doh_KDVP_line_values_ticker]] = tmpTradeDirectionMap;
+
+			// Insert this trade to correct direction
+			tmpTradeDirectionMap.clear();
+			transactionIdMap_t tmpTidMap;
+			tmpTidMap[currLineVec[Doh_KDVP_line_values_trans_id]] = currLineVec;
+			tmpTradeDirectionMap[direction] = tmpTidMap;
+			transactionMap[currLineVec[Doh_KDVP_line_values_ticker]] = tmpTradeDirectionMap;
+		}
+	}
+
+	return true;
 }
 
 // Get if element should be shown
@@ -722,36 +854,36 @@ static bool doShowElement(const elementInfo_t& element)
 	// Some parameters are shown only under certain conditions
 	if (element.elementId == Doh_KDVP_element_Purchase)
 	{
-		// Show if line element Transaction Type is "Buy" or "BuyCover"
-		if (lineValues[Doh_KDVP_line_values_trans_type] != "Buy" &&
-			lineValues[Doh_KDVP_line_values_trans_type] != "BuyCover")
+		// Show if line element Transaction Type is transactionTypeNames[transactionTypeBuy] or transactionTypeNames[transactionTypeBuyCover]
+		if (currLineValues[Doh_KDVP_line_values_trans_type] != transactionTypeNames[transactionTypeBuy] &&
+			currLineValues[Doh_KDVP_line_values_trans_type] != transactionTypeNames[transactionTypeBuyCover])
 			return false;
 	}
 	else if (element.elementId == Doh_KDVP_element_Sale)
 	{
-		// Show if line element Transaction Type is "Sell" or "SellShort"
-		if (lineValues[Doh_KDVP_line_values_trans_type] != "Sell" &&
-			lineValues[Doh_KDVP_line_values_trans_type] != "SellShort")
+		// Show if line element Transaction Type is transactionTypeNames[transactionTypeSell] or transactionTypeNames[transactionTypeSellShort]
+		if (currLineValues[Doh_KDVP_line_values_trans_type] != transactionTypeNames[transactionTypeSell] &&
+			currLineValues[Doh_KDVP_line_values_trans_type] != transactionTypeNames[transactionTypeSellShort])
 			return false;
 	}
 	else if (element.elementId == Doh_KDVP_element_Securities)
 	{
-		// Show if line element Transaction Type is "Buy" or "Sell"
-		if (lineValues[Doh_KDVP_line_values_trans_type] != "Buy" &&
-			lineValues[Doh_KDVP_line_values_trans_type] != "Sell")
+		// Show if line element Transaction Type is transactionTypeNames[transactionTypeBuy] or transactionTypeNames[transactionTypeSell]
+		if (currLineValues[Doh_KDVP_line_values_trans_type] != transactionTypeNames[transactionTypeBuy] &&
+			currLineValues[Doh_KDVP_line_values_trans_type] != transactionTypeNames[transactionTypeSell])
 			return false;
 	}
 	else if (element.elementId == Doh_KDVP_element_SecuritiesShort)
 	{
-		// Show if line element Transaction Type is "SellShort" or "BuyCover"
-		if (lineValues[Doh_KDVP_line_values_trans_type] != "SellShort" &&
-			lineValues[Doh_KDVP_line_values_trans_type] != "BuyCover")
+		// Show if line element Transaction Type is transactionTypeNames[transactionTypeSellShort] or transactionTypeNames[transactionTypeBuyCover]
+		if (currLineValues[Doh_KDVP_line_values_trans_type] != transactionTypeNames[transactionTypeSellShort] &&
+			currLineValues[Doh_KDVP_line_values_trans_type] != transactionTypeNames[transactionTypeBuyCover])
 			return false;
 	}
 	else if (element.elementId == Doh_KDVP_element_F10)	// Loss valid
 	{
 		// Show if line element Transaction Type is Sell"
-		if (lineValues[Doh_KDVP_line_values_trans_type] != "Sell")
+		if (currLineValues[Doh_KDVP_line_values_trans_type] != transactionTypeNames[transactionTypeSell])
 			return false;
 	}
 	else if (element.elementId == Doh_KDVP_element_InventoryListType ||
@@ -801,12 +933,12 @@ static int getConvertedPrice(const elementInfo_t& element, string& convertedPric
 		return 1;
 	}
 
-	// Get convertion rate from currConvFile
+	// Get convertion rate
 	string convRateStr;
-	if (getConvertionRate(lineValues[Doh_KDVP_line_values_date], convRateStr) != 0)
+	if (getConvertionRate(currLineValues[Doh_KDVP_line_values_date], convRateStr) != 0)
 	{
 		cout << __FUNCTION__ << ":" << __LINE__ << ": "
-			<< "getConvertionRate failed for date: " << lineValues[Doh_KDVP_line_values_date] << endl;
+			<< "getConvertionRate failed for date: " << currLineValues[Doh_KDVP_line_values_date] << endl;
 
 		return 1;
 	}
@@ -814,7 +946,7 @@ static int getConvertedPrice(const elementInfo_t& element, string& convertedPric
 	// Convert rate using convertion rate
 	double convRateDouble, priceDouble, convPriceDouble;
 	convRateDouble = atof(convRateStr.c_str());
-	priceDouble = atof(lineValues[Doh_KDVP_line_values_price].c_str());
+	priceDouble = atof(currLineValues[Doh_KDVP_line_values_price].c_str());
 	convPriceDouble = priceDouble/convRateDouble;
 
 	stringstream ss;
@@ -824,6 +956,62 @@ static int getConvertedPrice(const elementInfo_t& element, string& convertedPric
 	return 0;
 }
 
+// Days between two dates
+//	- expects format "yyyy-mm-dd"
+//  - expects dateHighStr to be higher date than dateLowStr
+static double daysBetweenDates(const string& dateHighStr, const string& dateLowStr)
+{
+	tm dateHigh = {0};
+	tm dateLow = {0};
+	unsigned year, month, day;
+	stringstream ss;
+
+	// Break down both dates
+	ss.str("");
+	ss.clear();
+	ss << dateHighStr.substr(0, 4);
+	ss >> year;
+	ss.str("");
+	ss.clear();
+	ss << dateHighStr.substr(5, 2);
+	ss >> month;
+	ss.str("");
+	ss.clear();
+	ss << dateHighStr.substr(8, 2);
+	ss >> day;
+
+	dateHigh.tm_mday = day;
+	dateHigh.tm_mon = month - 1;
+	dateHigh.tm_year = year - 1900;
+
+	ss.str("");
+	ss.clear();
+	ss << dateLowStr.substr(0, 4);
+	ss >> year;
+	ss.str("");
+	ss.clear();
+	ss << dateLowStr.substr(5, 2);
+	ss >> month;
+	ss.str("");
+	ss.clear();
+	ss << dateLowStr.substr(8, 2);
+	ss >> day;
+
+	dateLow.tm_mday = day;
+	dateLow.tm_mon = month - 1;
+	dateLow.tm_year = year - 1900;
+
+	time_t timeHigh = mktime(&dateHigh);
+	time_t timeLow = mktime(&dateLow);
+
+	double daysDiff = -1;
+
+	if ( timeHigh != (std::time_t)(-1) && timeLow != (std::time_t)(-1) )
+		daysDiff = difftime(timeHigh, timeLow) / (60 * 60 * 24);
+
+	return daysDiff;
+}
+
 // Get specific element parameter value
 static int getSpecificParamValue(const elementInfo_t& element, string& val)
 {
@@ -831,8 +1019,8 @@ static int getSpecificParamValue(const elementInfo_t& element, string& val)
 	{
 		// InventoryListType can be "PLVP" or "PLVPSHORT" depending on
 		// line value Transaction Type
-		if (lineValues[Doh_KDVP_line_values_trans_type] == "Sell" ||
-			lineValues[Doh_KDVP_line_values_trans_type] == "SellShort")
+		if (currLineValues[Doh_KDVP_line_values_trans_type] == transactionTypeNames[transactionTypeSell] ||
+			currLineValues[Doh_KDVP_line_values_trans_type] == transactionTypeNames[transactionTypeSellShort])
 			val = "PLVPSHORT";
 		else
 			val = "PLVP";
@@ -840,12 +1028,12 @@ static int getSpecificParamValue(const elementInfo_t& element, string& val)
 	else if (element.elementId == Doh_KDVP_element_F1)
 	{
 		// F2 is "B" for long purchase and "A" for short cover purchase
-		if (lineValues[Doh_KDVP_line_values_trans_type] == "Buy")
+		if (currLineValues[Doh_KDVP_line_values_trans_type] == transactionTypeNames[transactionTypeBuy])
 		{
 			// Long purchase
 			val = "B";
 		}
-		else if (lineValues[Doh_KDVP_line_values_trans_type] == "BuyCover")
+		else if (currLineValues[Doh_KDVP_line_values_trans_type] == transactionTypeNames[transactionTypeBuyCover])
 		{
 			// Short cover purchase
 			val = "A";
@@ -854,12 +1042,12 @@ static int getSpecificParamValue(const elementInfo_t& element, string& val)
 	else if (element.elementId == Doh_KDVP_element_F2)
 	{
 		// F2 is "B" for long purchase and "A" for short cover purchase
-		if (lineValues[Doh_KDVP_line_values_trans_type] == "Buy")
+		if (currLineValues[Doh_KDVP_line_values_trans_type] == transactionTypeNames[transactionTypeBuy])
 		{
 			// Long purchase
 			val = "B";
 		}
-		else if (lineValues[Doh_KDVP_line_values_trans_type] == "BuyCover")
+		else if (currLineValues[Doh_KDVP_line_values_trans_type] == transactionTypeNames[transactionTypeBuyCover])
 		{
 			// Short cover purchase
 			val = "A";
@@ -878,17 +1066,17 @@ static int getSpecificParamValue(const elementInfo_t& element, string& val)
 			remainingShares = 0;
 
 		// Get current shares value
-		currValSs << lineValues[Doh_KDVP_line_values_shares];
+		currValSs << currLineValues[Doh_KDVP_line_values_shares];
 		currValSs >> currVal;
 
 		// Calculate remaining shares according to transaction type
-		if (lineValues[Doh_KDVP_line_values_trans_type] == "Buy" ||
-			lineValues[Doh_KDVP_line_values_trans_type] == "BuyCover")
+		if (currLineValues[Doh_KDVP_line_values_trans_type] == transactionTypeNames[transactionTypeBuy] ||
+			currLineValues[Doh_KDVP_line_values_trans_type] == transactionTypeNames[transactionTypeBuyCover])
 		{
 			valInt = remainingShares + currVal;
 		}
-		if (lineValues[Doh_KDVP_line_values_trans_type] == "Sell" ||
-			lineValues[Doh_KDVP_line_values_trans_type] == "SellShort")
+		else if (currLineValues[Doh_KDVP_line_values_trans_type] == transactionTypeNames[transactionTypeSell] ||
+				currLineValues[Doh_KDVP_line_values_trans_type] == transactionTypeNames[transactionTypeSellShort])
 		{
 			valInt = remainingShares - currVal;
 		}
@@ -902,6 +1090,258 @@ static int getSpecificParamValue(const elementInfo_t& element, string& val)
 
 		// Store remaining shares
 		remainingShares = valInt;
+	}
+	else if (element.elementId == Doh_KDVP_element_F10)
+	{
+		// Loss valid
+		if (currLineValues[Doh_KDVP_line_values_trans_type] != transactionTypeNames[transactionTypeSell])
+		{
+			cout << __FUNCTION__ << ":" << __LINE__ << ": "
+				<< "Invalid trans type for loss valid: " << currLineValues[Doh_KDVP_line_values_trans_type] << endl;
+
+			return 1;
+		}
+
+		// Get a copy of all long transactions for this ticker
+		transactionIdMap_t tradesMap = transactionMap[currLineValues[Doh_KDVP_line_values_ticker]][tradeLong];
+
+		double daysDiff;
+		unsigned currentShares = 0;
+		string lastPurchaseDate;
+		string lastSaleDate;
+		stringstream ss;
+		unsigned transThis, transThat;
+		unsigned purchasesWithin30DaysBefore = 0;
+		unsigned sharesInt;
+		unsigned washedShares = 0;			// Value of total shares washed
+		bool lastTransactionSale = true;	// Not if last transaction is sale, needed later
+		unsigned buysCounter = 0;			// Buys counter
+		unsigned sameDaySaleCounter = 0;	// Counter of sales on the same day
+
+		// We have a wash sale under these rules:
+		// 	1. We bought additional shares within 30 days after this sale
+		//	2. We held some additional shares within 30 days before this sale. This means:
+		//		a. We bought more than once within 30 days before
+		//		b. We bought only once within 30 days before, but held some shares from before
+		//		  (additionalShares is bigger than 0).
+
+		for (transactionIdMap_t::iterator it = tradesMap.begin(); it != tradesMap.end(); it++)
+		{
+			// Skip the sale we are processing
+			if (it->second[Doh_KDVP_line_values_trans_id] == currLineValues[Doh_KDVP_line_values_trans_id])
+			{
+				lastTransactionSale = true;
+				continue;
+			}
+
+			// Date before or after this sale?
+			ss.str("");
+			ss.clear();
+			ss << currLineValues[Doh_KDVP_line_values_trans_id];
+			ss >> transThis;
+			ss.str("");
+			ss.clear();
+			ss << it->second[Doh_KDVP_line_values_trans_id];
+			ss >> transThat;
+
+			if (transThis > transThat)
+			{
+				// Before or on the same day
+				if (it->second[Doh_KDVP_line_values_trans_type] == transactionTypeNames[transactionTypeBuy])
+				{
+					lastTransactionSale = false;
+					buysCounter++;
+
+					// Purchase - calculate current shares, washed shares and store last purchase date
+					ss.str("");
+					ss.clear();
+					ss << it->second[Doh_KDVP_line_values_shares];
+					ss >> sharesInt;
+
+					daysDiff = daysBetweenDates(currLineValues[Doh_KDVP_line_values_date], it->second[Doh_KDVP_line_values_date]);
+
+					// Was this buy within 30 days and with a newer date than previous and is also not on the day of this sale?
+					if (daysDiff > 0 && daysDiff <= 30 && lastPurchaseDate.size() != 0
+						&& it->second[Doh_KDVP_line_values_date] != lastPurchaseDate)
+					{
+ 						if (purchasesWithin30DaysBefore > 0)
+						{
+							// If current count of buys inside 30 days is bigger than 0,
+							// we are under wash sale rule 2.a
+							washedShares += sharesInt;
+						}
+ 						else if (currentShares > 0 && it->second[Doh_KDVP_line_values_date] != lastPurchaseDate)
+ 						{
+ 							// If currentShares is bigger than 0, and we're buying with a newer date
+ 							// we are buying additional shares, which are under wash sale rule 2.b)
+ 							washedShares += sharesInt;
+ 						}
+
+						// Increase counter of purchases within 30 days before
+						purchasesWithin30DaysBefore++;
+					}
+
+					// Increase current shares
+					currentShares += sharesInt;
+
+					// If this date is more than 30 days after last purchase date, reset alreadyWashed value
+					if (lastPurchaseDate.size() != 0 &&
+						daysBetweenDates(it->second[Doh_KDVP_line_values_date],lastPurchaseDate) > 30)
+						alreadyWashed = 0;
+
+					// Store lastpurchase  date
+					lastPurchaseDate = it->second[Doh_KDVP_line_values_date];
+				}
+				else
+				{
+					lastTransactionSale = true;
+
+					// Sale, update current shares counts
+					ss.str("");
+					ss.clear();
+					ss << it->second[Doh_KDVP_line_values_shares];
+					unsigned sharesInt;
+					ss >> sharesInt;
+
+					// Same day sale?+
+					daysDiff = daysBetweenDates(currLineValues[Doh_KDVP_line_values_date], it->second[Doh_KDVP_line_values_date]);
+					if (daysDiff == 0)
+						sameDaySaleCounter++;
+
+					currentShares -= sharesInt;
+					if (currentShares < 0)
+					{
+						cout << __FUNCTION__ << ":" << __LINE__ << ": "
+							<< "Error. Negative current shares count: " << currentShares
+							<< "Ticker: " << it->second[Doh_KDVP_line_values_ticker]
+							<< ", transaction id: " << it->second[Doh_KDVP_line_values_trans_id]
+							<< ", date: " << it->second[Doh_KDVP_line_values_date] << endl;
+
+						return 1;
+					}
+
+					if (washedShares > 0)
+					{
+						if (sharesInt > washedShares)
+						{
+							cout << __FUNCTION__ << ":" << __LINE__ << ": "
+								<< "Error. Negative washed shares count: " << washedShares
+								<< "Ticker: " << it->second[Doh_KDVP_line_values_ticker]
+								<< ", transaction id: " << it->second[Doh_KDVP_line_values_trans_id]
+								<< ", date: " << it->second[Doh_KDVP_line_values_date] << endl;
+
+							return 1;
+						}
+
+						washedShares -= sharesInt;
+					}
+
+					// Store last sale date
+					lastSaleDate = it->second[Doh_KDVP_line_values_date];
+				}
+			}
+			else
+			{
+				// After - interested only in purchases
+				if (it->second[Doh_KDVP_line_values_trans_type] != transactionTypeNames[transactionTypeBuy])
+				{
+					lastTransactionSale = true;
+					continue;
+				}
+
+				buysCounter++;
+
+				lastTransactionSale = false;
+
+				// If purchase is within 30 days after, we are under rule 1
+				daysDiff = daysBetweenDates(it->second[Doh_KDVP_line_values_date], currLineValues[Doh_KDVP_line_values_date]);
+
+				if (daysDiff > 0 && daysDiff <= 30 &&
+				   (lastSaleDate != currLineValues[Doh_KDVP_line_values_date]/* && alreadyWashed*/))
+				{
+					ss.str("");
+					ss.clear();
+					ss << it->second[Doh_KDVP_line_values_shares];
+					ss >> sharesInt;
+
+					washedShares += sharesInt;
+				}
+
+				// Store lastpurchase  date
+				lastPurchaseDate = it->second[Doh_KDVP_line_values_date];
+			}
+		}
+
+		// If washedShares is bigger than 0, we have a potential wash sale
+		if (washedShares == 0)
+			val = "true";
+		else
+		{
+			ss.str("");
+			ss.clear();
+			ss << currLineValues[Doh_KDVP_line_values_shares];
+			ss >> sharesInt;
+
+			if (alreadyWashed >= sharesInt && buysCounter < 2)
+			{
+				// We already washed before more than we need to by this purchase
+				val = "true";
+
+				cout << "No wash sale... "
+					<< "Ticker: " << currLineValues[Doh_KDVP_line_values_ticker]
+					<< ", transaction id: " << currLineValues[Doh_KDVP_line_values_trans_id]
+					<< ", date: " << currLineValues[Doh_KDVP_line_values_date]
+					<< ", should wash shares: " << sharesInt
+					<< ", but already washed: " << alreadyWashed << endl;
+
+				// Decrease already washed shares
+				alreadyWashed -= sharesInt;
+			}
+			else
+			{
+				// Special case - If we're selling all remaining shares at once,
+				// and the last transaction is sale
+				if ((currentShares == sharesInt) &&
+					((lastTransactionSale && buysCounter < 2) ||
+					 (lastTransactionSale && transThis > transThat)))
+				{
+					val = "true";
+/*
+					cout << "No wash sale... "
+						<< "Ticker: " << currLineValues[Doh_KDVP_line_values_ticker]
+						<< ", transaction id: " << currLineValues[Doh_KDVP_line_values_trans_id]
+						<< ", date: " << currLineValues[Doh_KDVP_line_values_date]
+						<< ", selling all shares in one sale: " << sharesInt << endl;
+*/
+				}
+				else
+				{
+					// We must wash the remainder to already washed shares
+					unsigned sharesToWash = washedShares - alreadyWashed;
+
+					if (sharesToWash > 0)
+					{
+						val = "false";
+
+						// We can't wash more than we're selling
+						if (sharesInt < sharesToWash)
+							sharesToWash = sharesInt;
+
+						// Make a note if wash sale has been partial or complete
+						cout << "Wash sale... "
+							 << "Ticker: " << currLineValues[Doh_KDVP_line_values_ticker]
+							 << ", transaction id: " << currLineValues[Doh_KDVP_line_values_trans_id]
+							 << ", date: " << currLineValues[Doh_KDVP_line_values_date]
+							 << ", washed shares: " << sharesToWash
+							 << ", remaining unwashed shares: " << (sharesInt - sharesToWash) << endl;
+
+						alreadyWashed += sharesToWash;
+					}
+					else
+						val = "true";
+				}
+			}
+		}
 	}
 
 	return 0;
@@ -926,7 +1366,7 @@ static int getElementParamValue(const elementInfo_t& element, string& val)
 	}
 	else if (element.lineElementId != -1)
 	{
-		// If lineElementId is not -1, this parameter is mapped from lineValues vector
+		// If lineElementId is not -1, this parameter is mapped from currLineValues vector
 		if (useCurrConversion && element.lineElementId == Doh_KDVP_line_values_price)
 		{
 			// Convert price value
@@ -942,7 +1382,7 @@ static int getElementParamValue(const elementInfo_t& element, string& val)
 			val = convertVal;
 		}
 		else
-			val = lineValues.at(element.lineElementId);	// No conversion
+			val = currLineValues.at(element.lineElementId);	// No conversion
 	}
 	else
 	{
@@ -958,9 +1398,6 @@ static int getElementParamValue(const elementInfo_t& element, string& val)
 
 	return 0;
 }
-
-static unsigned numLines = 0;			// Number of lines in file
-static unsigned lineNum = 0;			// Current line number
 
 // Map of groups that should be closed on new item
 struct closeGroupsData_t
@@ -991,8 +1428,8 @@ static bool ifStartNewMultiLineGroup(const elementInfo_t& element, unsigned& dep
 	else if (element.elementId == Doh_KDVP_element_Securities)
 	{
 		if (ifExistingItem(element) &&
-		    (lineValues[Doh_KDVP_line_values_trans_type] == "Buy" ||
-		    lineValues[Doh_KDVP_line_values_trans_type] == "Sell"))
+		    (currLineValues[Doh_KDVP_line_values_trans_type] == transactionTypeNames[transactionTypeBuy] ||
+		    currLineValues[Doh_KDVP_line_values_trans_type] == transactionTypeNames[transactionTypeSell]))
 		{
 			ret = false;
 			depth = 1;
@@ -1001,8 +1438,8 @@ static bool ifStartNewMultiLineGroup(const elementInfo_t& element, unsigned& dep
 	else if (element.elementId == Doh_KDVP_element_SecuritiesShort)
 	{
 		if (ifExistingItem(element) &&
-			(lineValues[Doh_KDVP_line_values_trans_type] == "BuyCover" ||
-			lineValues[Doh_KDVP_line_values_trans_type] == "SellShort"))
+			(currLineValues[Doh_KDVP_line_values_trans_type] == transactionTypeNames[transactionTypeBuyCover] ||
+			currLineValues[Doh_KDVP_line_values_trans_type] == transactionTypeNames[transactionTypeSellShort]))
 		{
 			ret = false;
 			depth = 1;
@@ -1024,7 +1461,7 @@ static bool ifCloseOpenGroups(const elementInfo_t& element)
 
 // Core function that processes elements of the XML tree
 // It can be called recursively while processing current element
-static int processElement(const elementInfo_t& element)
+static int processElement(const elementInfo_t& element, ofstream& outputFile)
 {
 	string elementValue;
 
@@ -1047,6 +1484,10 @@ static int processElement(const elementInfo_t& element)
 	// Continue if this element must be shown in present context
 	if (!doShowElement(element))
 		return 0;
+
+	// If new item is being processed, reset alreadyWashed value
+	if (!ifExistingItem(element))
+		alreadyWashed = 0;
 
 	// Basic rules for building tags:
 	//		- change depth using DEPTH_PLUS or DEPTH_MINUS (otherwise it stays as it is)
@@ -1110,7 +1551,7 @@ static int processElement(const elementInfo_t& element)
 
 			// One depth deeper
 			DEPTH_PLUS
-			if (processElement(elementInfoMap.at(*it)) != 0)
+			if (processElement(elementInfoMap.at(*it), outputFile) != 0)
 			{
 				cout << __FUNCTION__ << ":" << __LINE__ << ": "
 						<< "Error processing element " << elementInfoMap.at(*it).name << endl;
@@ -1122,7 +1563,7 @@ static int processElement(const elementInfo_t& element)
 		// End here only groups which are not multilines
 		if (elementInfoMap.at(element.elementId).multiLine != multiLineGroupYes)
 			END_GROUP(outputFile, elementInfoMap.at(element.elementId).name)
-		else if (lineNum == numLines)	// Last line, close final groups
+		else if (lastElement)	// Last line, close final groups
 			END_GROUP(outputFile, elementInfoMap.at(element.elementId).name)
 	}
 	else if (elementInfoMap.at(element.elementId).type == tagTypeParam)
@@ -1149,44 +1590,107 @@ static int processElement(const elementInfo_t& element)
 	return 0;
 }
 
-// Usage: xyz.exe [convert]
+// Usage: makexml.exe [help]¸[input=input_file_name] [output=output_file_name] [convert=conversion_file_name] [rate=currency]
+// Examples:
+// 		makexml.exe input=infile.csv output=outfile.xml convert=currency.xml rate=JPY
+// 	 Using default file names and default currency conversion (USD):
+//		makexml.exe convert
 int main(int argc, char* argv[])
 {
+	static ifstream baseFile;
+	static ofstream outputFile;
+
 	// Strings from base file that should be inserted before and after our content
 	string beforeBaseStr;
 	string afterBaseStr;
 
-	if (argc >= 2 && !strcmp(argv[1], "convert"))
+	if (argc > 1)
+	{
+		// Parse arguments
+		string arg;
+
+		for (unsigned i = 1; i < argc; i++)
+		{
+			arg = argv[i];
+			if (!arg.compare(0, 4, "help"))
+			{
+				cout << endl;
+				cout << "  Usage: makexml.exe [help] [input=input_file_name] [output=output_file_name] [convert=conversion_file_name] [rate=currency]" << endl << endl;
+				cout << "  Example: " << endl;
+				cout << "      makexml.exe input=infile.csv output=outfile.xml convert=currency.xml rate=JPY" << endl;
+				cout << "  Example: Using default file names and default currency conversion (USD): " << endl;
+				cout << "      makexml.exe convert" << endl << endl;
+
+				return 0;
+			}
+			else if (!arg.compare(0, 7, "convert"))
+			{
+				useCurrConversion = true;
+
+				if (arg.length() == 7)
+					continue;			// Default conversion
+				else
+				{
+					// Conversion file
+					currConvFileName = arg.substr(arg.find_first_of("=")+1);
+				}
+			}
+			else if (!arg.compare(0, 6, "input="))
+			{
+				// Input file
+				inputFileName = arg.substr(arg.find_first_of("=")+1);
+			}
+			else if (!arg.compare(0, 7, "output="))
+			{
+				// Output file
+				outputFileName = arg.substr(arg.find_first_of("=")+1);
+			}
+			else if (!arg.compare(0, 5, "rate="))
+			{
+				// Rate
+				tagTecaj = arg.substr(arg.find_first_of("=")+1);
+			}
+		}
+	}
+
+	cout << "  inputFileName: " << inputFileName << endl;
+	cout << "  outputFileName: " << outputFileName << endl;
+	cout << "  currConvFileName: " << currConvFileName << endl;
+
+	if (useCurrConversion)
 	{
 		// Transform currency conversion file to local storage
 		if (!conversionFileToLocalStorage(currConvFileName))
 		{
 			cout << __FUNCTION__ << ":" << __LINE__ << ": "
-				<< "Error converting currency file to local storage!" << endl;
-				
+					<< "Error converting currency file to local storage!" << endl;
+
 			return 1;
 		}
-		cout << "Using currency conversion" << endl;
-		useCurrConversion = true;
+		cout << "  Using currency conversion to: " << tagTecaj << endl;
 	}
 	else
-		cout << "No currency conversion" << endl;
+		cout << "  No currency conversion" << endl;
 
-	// Open all files
+	cout << endl;
+
+	// Convert input file to local storage
+	if (!inputFileToLocalStorage(inputFileName))
+	{
+		cout << __FUNCTION__ << ":" << __LINE__ << ": "
+			<< "Error converting input file to local storage!" << endl;
+
+		return 1;
+	}
+
+	// Open base and output files
 	baseFile.open(baseFileName.c_str(), ifstream::in);
-	inputFile.open(inputFileName.c_str(), ifstream::in);
 	outputFile.open(outputFileName.c_str(), ofstream::out|ofstream::binary);
 
 	if (!baseFile.is_open())
 	{
 		cout << __FUNCTION__ << ":" << __LINE__ << ": "
 				<< "Cannot open base file!" << endl;
-		return 1;
-	}
-	else if (!inputFile.is_open())
-	{
-		cout << __FUNCTION__ << ":" << __LINE__ << ": "
-				<< "Cannot open input file!" << endl;
 		return 1;
 	}
 	else if (!outputFile.is_open())
@@ -1197,45 +1701,54 @@ int main(int argc, char* argv[])
 	}
 
 	// Set before and after strings
-	setBaseStr(beforeBaseStr, afterBaseStr);
+	setBaseStr(beforeBaseStr, afterBaseStr, baseFile);
 
 	// Copy "before" string into file
 	outputFile << beforeBaseStr;
 
-	string line;
-	// Read file once just to set numLines
-	while(getline(inputFile, line))
-		numLines++;
-
-	// Set stream pointer to beginning
-	inputFile.clear();
-	inputFile.seekg(0);
-
-	// The main loop -
-	// Read input file line by line and insert values in xml
-	while(getline(inputFile, line))
+	// The main loop - go through all transactions and insert them into XML
+	for (transactionMap_t::iterator it1 = transactionMap.begin(); it1 != transactionMap.end(); it1++)
 	{
-		lineNum++;
-		if (setLineValues(line) != 0)
+		// Mind that this is a map-in-map-in-map first sorted by ticker,
+		// then by transaction type (long, short) and then by transaction id
+		// Error check - the inside map should not be empty
+		if (it1->second.size() == 0)
 		{
 			cout << __FUNCTION__ << ":" << __LINE__ << ": "
-					<< "Error setting line values at line " << lineNum << endl;
+					<< "Transaction map empty for ticker: " << it1->first << endl;
 			return 1;
 		}
 
-		// Start processing from rootElement
-		if (elementInfoMap.find(rootElement) == elementInfoMap.end())
+		for (tradeDirectionMap_t::iterator it2 = it1->second.begin(); it2 != it1->second.end(); it2++)
 		{
-			cout << __FUNCTION__ << ":" << __LINE__ << ": "
-					<< "Cannot find root element " << rootElement << endl;
-			return 1;
-		}
+			// Go through both long and short trades
+			for (transactionIdMap_t::iterator it3 = it2->second.begin(); it3 != it2->second.end(); it3++)
+			{
+				// Set current line
+				currLineValues = it3->second;
 
-		if (processElement(elementInfoMap.at(rootElement)) != 0)
-		{
-			cout << __FUNCTION__ << ":" << __LINE__ << ": "
-					<< "Error processing root element " << rootElement << endl;
-			return 1;
+				// Make a note if the very last element is being processed (to close all the groups)
+				transactionMap_t::iterator it11 = it1;
+				tradeDirectionMap_t::iterator it21 = it2;
+				transactionIdMap_t::iterator it31 = it3;
+				if (++it31 == it2->second.end() && ++it21 == it1->second.end() && ++it11 == transactionMap.end())
+					lastElement = true;
+
+				// Start processing from rootElement
+				if (elementInfoMap.find(rootElement) == elementInfoMap.end())
+				{
+					cout << __FUNCTION__ << ":" << __LINE__ << ": "
+							<< "Cannot find root element " << rootElement << endl;
+					return 1;
+				}
+
+				if (processElement(elementInfoMap.at(rootElement), outputFile) != 0)
+				{
+					cout << __FUNCTION__ << ":" << __LINE__ << ": "
+							<< "Error processing root element " << rootElement << endl;
+					return 1;
+				}
+			}
 		}
 	}
 
@@ -1244,7 +1757,6 @@ int main(int argc, char* argv[])
 
 	// Close all files
 	baseFile.close();
-	inputFile.close();
 	outputFile.close();
 
 	return 0;
